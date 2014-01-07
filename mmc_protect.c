@@ -25,6 +25,8 @@ struct another_mmc_csd {
   uint8_t erase_grp_mult;
   uint8_t wp_grp_size;
   uint8_t wp_grp_enable;
+  uint8_t perm_wp;
+  uint8_t temp_wp;
 };
 
 static struct mmc_card *g_card;
@@ -50,6 +52,8 @@ get_csd(struct mmc_card *card, struct another_mmc_csd *csd)
   csd->erase_grp_mult = UNSTUFF_BITS(card->raw_csd, 37, 5);
   csd->wp_grp_size = UNSTUFF_BITS(card->raw_csd, 32, 5);
   csd->wp_grp_enable = UNSTUFF_BITS(card->raw_csd, 31, 1);
+  csd->perm_wp = UNSTUFF_BITS(card->raw_csd, 13, 1);
+  csd->temp_wp = UNSTUFF_BITS(card->raw_csd, 12, 1);
 }
 
 #define MMC_CMD_RETRIES 3
@@ -105,14 +109,39 @@ get_card_status(struct mmc_card *card, u32 *status)
   return 0;
 }
 
+#define MMC_WR_BLOCK_LEN             512
+
+#define MMC_EXT_USER_WP              171
+#define MMC_EXT_ERASE_GROUP_DEF      175
+#define MMC_EXT_ERASE_MEM_CONT       181
+#define MMC_EXT_CMMC_BUS_WIDTH       183
+#define MMC_EXT_CMMC_HS_TIMING       185
+#define MMC_EXT_HC_WP_GRP_SIZE       221
+#define MMC_EXT_ERASE_TIMEOUT_MULT   223
+#define MMC_EXT_HC_ERASE_GRP_SIZE    224
+
+#define IS_BIT_SET_EXT_CSD(val, bit) (((ext_csd[val]) & (1<<(bit))) != 0)
+
+#define SETUP_MMC_EXT_USER_WP
+
+#define MMC_US_PWR_WP_EN_BIT         0
+#define MMC_US_PERM_WP_EN_BIT        2
+#define MMC_US_PWR_WP_DIS_BIT        3
+#define MMC_US_PERM_WP_DIS_BIT       4
+
 static bool
-clear_write_protect(struct mmc_card *card, u32 start, u32 size)
+set_or_clear_write_protect(struct mmc_card *card, u32 start, u32 size, int is_set)
 {
   struct another_mmc_csd csd;
   struct mmc_command cmd;
   u32 write_protect_group_size;
-  int error;
+  int error = 0;
   unsigned int i, loop_count;
+  const char *mode;
+  u8 *ext_csd;
+
+  mode = is_set ? "set" : "clear";
+  printk(KERN_ERR "%s (start = 0x%08x, size = 0x%08x)\n", mode, start, size);
 
   mmc_claim_host(card->host);
 
@@ -120,12 +149,53 @@ clear_write_protect(struct mmc_card *card, u32 start, u32 size)
 
   write_protect_group_size = (csd.erase_grp_size + 1) * (csd.erase_grp_mult + 1) * (csd.wp_grp_size + 1);
 
+  ext_csd = kmalloc(512, GFP_KERNEL);
+  if (ext_csd) {
+    error = mmc_send_ext_csd(card, ext_csd);
+
+    if (!error) {
+      int mmc_us_perm_wp_en = IS_BIT_SET_EXT_CSD(MMC_EXT_USER_WP, MMC_US_PERM_WP_EN_BIT);
+      int mmc_us_pwr_wp_dis = IS_BIT_SET_EXT_CSD(MMC_EXT_USER_WP, MMC_US_PWR_WP_DIS_BIT);
+
+      if (mmc_us_perm_wp_en) {
+	printk(KERN_ERR "MMC_US_PERM_WP_EN is set\n");
+	kfree(ext_csd);
+	goto error_exit;
+      }
+
+      if (mmc_us_pwr_wp_dis) {
+	printk(KERN_ERR "MMC_US_PWR_WP_DIS is set\n");
+	kfree(ext_csd);
+	goto error_exit;
+      }
+
+      if (ext_csd[MMC_EXT_ERASE_GROUP_DEF]) {
+	write_protect_group_size = (512 * 1024)
+	                          * ext_csd[MMC_EXT_HC_WP_GRP_SIZE]
+	                          * ext_csd[MMC_EXT_HC_ERASE_GRP_SIZE]
+				  / MMC_WR_BLOCK_LEN;
+      }
+    }
+  }
+
+#ifdef SETUP_MMC_EXT_USER_WP
+  printk(KERN_INFO "setup MMC_EXT_USER_WP\n");
+  error = mmc_switch(card, EXT_CSD_CMD_SET_NORMAL,
+		     MMC_EXT_USER_WP,
+                     (1 << MMC_US_PWR_WP_EN_BIT) | ext_csd[MMC_EXT_USER_WP],
+		     card->ext_csd.generic_cmd6_time);
+  if (error) {
+    printk(KERN_ERR "Failed to setup MMC_EXT_USER_WP error(%x)\n", error);
+    //goto error_exit;
+  }
+#endif /* SETUP_MMC_EXT_USER_WP */
+
   memset(&cmd, 0, sizeof(struct mmc_command));
 
-  cmd.opcode = MMC_CLR_WRITE_PROT;
+  cmd.opcode = is_set ? MMC_SET_WRITE_PROT : MMC_CLR_WRITE_PROT;
   cmd.flags = MMC_RSP_SPI_R1B | MMC_RSP_R1B | MMC_CMD_AC;
 
-  loop_count = size / write_protect_group_size;
+  loop_count = (size + write_protect_group_size - 1) / write_protect_group_size;
   for (i = 0; i < loop_count; i++) {
     u32 status;
     cmd.arg = start + i * write_protect_group_size;
@@ -139,8 +209,24 @@ clear_write_protect(struct mmc_card *card, u32 start, u32 size)
     }
   }
 
+error_exit:
   if (error) {
-    printk(KERN_ERR "Failed to clear write protect error(%x)\n", error);
+    printk(KERN_ERR "Failed to %s write protect error(%x)\n", mode, error);
+  }
+
+#ifdef SETUP_MMC_EXT_USER_WP
+  printk(KERN_INFO "restore MMC_EXT_USER_WP\n");
+  error = mmc_switch(card, EXT_CSD_CMD_SET_NORMAL,
+		     MMC_EXT_USER_WP,
+                     ext_csd[MMC_EXT_USER_WP],
+		     card->ext_csd.generic_cmd6_time);
+  if (error) {
+    printk(KERN_ERR "Failed to restore MMC_EXT_USER_WP error(%x)\n", error);
+  }
+#endif /* SETUP_MMC_EXT_USER_WP */
+
+  if (ext_csd) {
+    kfree(ext_csd);
   }
 
   mmc_release_host(card->host);
@@ -229,12 +315,50 @@ print_write_protect_status(struct mmc_card *card, char *buffer)
   u32 address;
   int error;
   int ret = 0;
+  u8 *ext_csd;
 
   mmc_claim_host(card->host);
 
   get_csd(card, &csd);
 
+  ret += sprintf(buffer + ret, "perm_wp = %d\n", csd.perm_wp);
+  ret += sprintf(buffer + ret, "temp_wp = %d\n", csd.temp_wp);
+
   write_protect_group_size = (csd.erase_grp_size + 1) * (csd.erase_grp_mult + 1) * (csd.wp_grp_size + 1);
+
+  ret += sprintf(buffer + ret, "write_protect_group_size = %d\n", write_protect_group_size);
+
+  ext_csd = kmalloc(512, GFP_KERNEL);
+  if (ext_csd) {
+    error = mmc_send_ext_csd(card, ext_csd);
+
+    if (!error) {
+      int mmc_us_perm_wp_en = IS_BIT_SET_EXT_CSD(MMC_EXT_USER_WP, MMC_US_PERM_WP_EN_BIT);
+      int mmc_us_perm_wp_dis = IS_BIT_SET_EXT_CSD(MMC_EXT_USER_WP, MMC_US_PERM_WP_DIS_BIT);
+      int mmc_us_pwr_wp_en = IS_BIT_SET_EXT_CSD(MMC_EXT_USER_WP, MMC_US_PWR_WP_EN_BIT);
+      int mmc_us_pwr_wp_dis = IS_BIT_SET_EXT_CSD(MMC_EXT_USER_WP, MMC_US_PWR_WP_DIS_BIT);
+
+      ret += sprintf(buffer + ret, "mmc_ext_user_wp = 0x%02x\n", ext_csd[MMC_EXT_USER_WP]);
+      ret += sprintf(buffer + ret, "mmc_us_perm_wp_en = %d\n", mmc_us_perm_wp_en);
+      ret += sprintf(buffer + ret, "mmc_us_perm_wp_dis = %d\n", mmc_us_perm_wp_dis);
+      ret += sprintf(buffer + ret, "mmc_us_pwr_wp_en = %d\n", mmc_us_pwr_wp_en);
+      ret += sprintf(buffer + ret, "mmc_us_pwr_wp_dis = %d\n", mmc_us_pwr_wp_dis);
+
+      if (ext_csd[MMC_EXT_ERASE_GROUP_DEF]) {
+        ret += sprintf(buffer + ret, "mmc_ext_hc_wp_grp_size = %d\n", ext_csd[MMC_EXT_HC_WP_GRP_SIZE]);
+        ret += sprintf(buffer + ret, "mmc_ext_hc_erase_grp_size = %d\n", ext_csd[MMC_EXT_HC_ERASE_GRP_SIZE]);
+
+	write_protect_group_size = (512 * 1024)
+	                          * ext_csd[MMC_EXT_HC_WP_GRP_SIZE]
+	                          * ext_csd[MMC_EXT_HC_ERASE_GRP_SIZE]
+				  / MMC_WR_BLOCK_LEN;
+      }
+    }
+
+    kfree(ext_csd);
+  }
+
+  ret += sprintf(buffer + ret, "write_protect_group_size = %d\n", write_protect_group_size);
   group_count = card->ext_csd.sectors / write_protect_group_size;
 
   error = get_card_status(card, &status);
@@ -245,6 +369,8 @@ print_write_protect_status(struct mmc_card *card, char *buffer)
 
   for (address = 0; address < group_count; address += WRITE_PROTECT_INFO_BITS) {
     u64 write_protect_status;
+    memset(&write_protect_status, 0, sizeof write_protect_status);
+
     error = mmc_send_cxd_data(card, card->host,
                               CMD31_SEND_WRITE_PROT_TYPE,
                               address * write_protect_group_size,
@@ -275,8 +401,8 @@ mmc_protect_show(struct device *dev, struct device_attribute *attr, char *buffer
 static DEVICE_ATTR(status, S_IRUGO, mmc_protect_show, NULL);
 
 static ssize_t
-mmc_protect_clear(struct device *dev, struct device_attribute *attr,
-                  const char *buf, size_t count)
+mmc_protect_set_or_clear(struct device *dev, struct device_attribute *attr,
+                         const char *buf, size_t count, int is_set)
 {
   char *device_path;
   struct block_device *target = NULL;
@@ -311,7 +437,7 @@ mmc_protect_clear(struct device *dev, struct device_attribute *attr,
   start = (u32)target->bd_part->start_sect;
   size = (u32)target->bd_part->nr_sects;
 
-  clear_write_protect(g_card, start, size);
+  set_or_clear_write_protect(g_card, start, size, is_set);
   if (device_holding) {
     blkdev_put(target, FMODE_READ | FMODE_NDELAY);
   }
@@ -320,10 +446,26 @@ mmc_protect_clear(struct device *dev, struct device_attribute *attr,
   return count;
 }
 
+static ssize_t
+mmc_protect_set(struct device *dev, struct device_attribute *attr,
+                const char *buf, size_t count)
+{
+  return mmc_protect_set_or_clear(dev, attr, buf, count, 1);
+}
+
+static ssize_t
+mmc_protect_clear(struct device *dev, struct device_attribute *attr,
+                  const char *buf, size_t count)
+{
+  return mmc_protect_set_or_clear(dev, attr, buf, count, 0);
+}
+
+static DEVICE_ATTR(set, S_IWUGO, NULL, mmc_protect_set);
 static DEVICE_ATTR(clear, S_IWUGO, NULL, mmc_protect_clear);
 
 static struct attribute *dev_attrs[] = {
   &dev_attr_status.attr,
+  &dev_attr_set.attr,
   &dev_attr_clear.attr,
   NULL,
 };
